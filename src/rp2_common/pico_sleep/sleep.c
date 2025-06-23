@@ -47,7 +47,7 @@ static volatile bool __sleep_pin_triggered;
 static hardware_alarm_callback_t __sleep_user_callback;
 static int __sleep_alarm_num;
 static uint __sleep_gpio_pin;
-static uint32_t __sleep_event_mask;
+static uint32_t __sleep_event;
 
 bool dormant_source_valid(dormant_source_t dormant_source)
 {
@@ -224,87 +224,74 @@ bool sleep_goto_sleep_for(uint32_t delay_ms, hardware_alarm_callback_t callback)
     return true;
 }
 
-// Internal GPIO IRQ callback for waking from sleep
 static void __sleep_gpio_irq_callback(uint gpio, uint32_t events) {
-    if ((gpio == __sleep_gpio_pin) && (events & __sleep_event_mask)) {
-        // GPIO event triggered wake-up
+    if ((gpio == __sleep_gpio_pin) && (events & __sleep_event)) {
         __sleep_pin_triggered = true;
+
         // Cancel the timer alarm since the pin woke us first
         hardware_alarm_set_callback(__sleep_alarm_num, NULL);
         hardware_alarm_unclaim(__sleep_alarm_num);
+
         // Run the user callback (if provided) in IRQ context
         if (__sleep_user_callback) {
             __sleep_user_callback(__sleep_alarm_num);
         }
-        // Disable further interrupts from this GPIO and acknowledge the event
-        gpio_set_irq_enabled(gpio, __sleep_event_mask, false);
-        gpio_acknowledge_irq(gpio, __sleep_event_mask);
-        // (After this, execution will resume in sleep_goto_sleep_for_or_pin once WFI exits)
+
+        // Clear the irq so we can go back to dormant mode again if we want
+        gpio_set_irq_enabled(gpio, __sleep_event, false);
+        gpio_acknowledge_irq(gpio, __sleep_event);
     }
 }
 
 bool sleep_goto_sleep_for_or_pin(uint32_t delay_ms, hardware_alarm_callback_t callback,
                                  uint gpio_pin, bool edge, bool high) {
-    // Prepare GPIO event mask for the specified edge/level trigger
     bool level = !edge;
-    uint32_t event_mask = 0;
+    uint32_t event = 0;
     if (level) {
-        // Level-sensitive interrupt: high or low level
-        event_mask = high ? GPIO_IRQ_LEVEL_HIGH : GPIO_IRQ_LEVEL_LOW;
+        event = high ? GPIO_IRQ_LEVEL_HIGH : GPIO_IRQ_LEVEL_LOW;
     } else {
-        // Edge-sensitive interrupt: rising or falling edge
-        event_mask = high ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL;
+        event = high ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL;
     }
 
-    // Set up the hardware timer alarm for the delay
-    absolute_time_t t = make_timeout_time_ms(delay_ms);
+    // Turn off all clocks except for the timer
+    clocks_hw->sleep_en0 = 0x0;
+#if PICO_RP2040
+    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_SYS_TIMER_BITS;
+#elif PICO_RP2350
+    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_REF_TICKS_BITS | CLOCKS_SLEEP_EN1_CLK_SYS_TIMER0_BITS;
+#else
+#error Unknown processor
+#endif
+
     int alarm_num = hardware_alarm_claim_unused(true);
     hardware_alarm_set_callback(alarm_num, callback);
+    absolute_time_t t = make_timeout_time_ms(delay_ms);
     if (hardware_alarm_set_target(alarm_num, t)) {
-        // If the target time is already due (no sleep needed), clean up and return
         hardware_alarm_set_callback(alarm_num, NULL);
         hardware_alarm_unclaim(alarm_num);
         return false;
     }
 
     // Configure the GPIO as a wake-up source
-    gpio_set_input_enabled(gpio_pin, true);  // ensure GPIO is an input
-    // Save context for the IRQ handler
+    gpio_set_input_enabled(gpio_pin, true);
     __sleep_gpio_pin = gpio_pin;
-    __sleep_event_mask = event_mask;
+    __sleep_event = event;
     __sleep_alarm_num = alarm_num;
     __sleep_user_callback = callback;
     __sleep_pin_triggered = false;
-    // Enable the GPIO interrupt on this core with our internal ISR callback
-    gpio_set_irq_enabled_with_callback(gpio_pin, event_mask, true, &__sleep_gpio_irq_callback);
+    gpio_set_irq_enabled_with_callback(gpio_pin, event, true, &__sleep_gpio_irq_callback);
 
-    // Gate clocks: keep only the timer (and minimum required) running during sleep
-    clocks_hw->sleep_en0 = 0x0;
-#if PICO_RP2040
-    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_SYS_TIMER_BITS;   // keep system timer clock
-#elif PICO_RP2040_OTHER // (for RP2040 derivatives, if any)
-    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_SYS_TIMER_BITS;
-#elif PICO_RP2350
-    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_REF_TICKS_BITS | CLOCKS_SLEEP_EN1_CLK_SYS_TIMER0_BITS;
-#else
-#   error Unknown processor – update clock gating as appropriate
-#endif
+    stdio_flush();
+    processor_deep_sleep();
+    __wfi();
 
-    stdio_flush();            // flush any pending UART/USB output
-    processor_deep_sleep();   // enable deep sleep (set SCR.SLEEPDEEP)
-    __wfi();                  // enter sleep mode until an interrupt occurs
-
-    // Execution resumes here after wake (either by timer or GPIO)
-    // Disable the GPIO IRQ (if not already disabled) and clean up
-    gpio_set_irq_enabled(gpio_pin, event_mask, false);
-    gpio_acknowledge_irq(gpio_pin, event_mask);
+    // Clear the irq so we can go back to dormant mode again if we want
+    gpio_set_irq_enabled(gpio_pin, event, false);
+    gpio_acknowledge_irq(gpio_pin, event);
     if (!__sleep_pin_triggered) {
-        // Woke by timer alarm (GPIO didn’t trigger): cancel alarm callback and free it
         hardware_alarm_set_callback(alarm_num, NULL);
         hardware_alarm_unclaim(alarm_num);
-        // If a user callback was set, it has been called in the alarm ISR already
     }
-    // If __sleep_pin_triggered is true, the alarm was already cancelled in the GPIO ISR
 
     return true;
 }
