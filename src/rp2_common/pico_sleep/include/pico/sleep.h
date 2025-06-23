@@ -88,6 +88,21 @@ to allow for shorter duration sleeps.
  */
 bool sleep_goto_sleep_for(uint32_t delay_ms, hardware_alarm_callback_t callback);
 
+/*! \brief Send system to sleep for a specified duration in milliseconds, or until the specified GPIO changes. This provides an
+alternative to sleep_goto_sleep_until to allow for shorter duration sleeps.
+ *  \ingroup hardware_sleep
+ *
+ * One of the sleep_run_* functions must be called prior to this call
+ *
+ * \param delay_ms The duration to sleep for in milliseconds.
+ * \param callback Function to call on wakeup.
+ * \param gpio_pin The pin to provide the wake up
+ * \param edge true for leading edge, false for trailing edge
+ * \param high true for active high, false for active low
+ * \return Returns true if the device went to sleep
+ */
+bool sleep_goto_sleep_for_or_pin(uint32_t delay_ms, hardware_alarm_callback_t callback, uint gpio_pin, bool edge, bool high);
+
 /*! \brief Send system to dormant until the specified time, note for RP2040 the RTC must be driven by an external clock
  *  \ingroup hardware_sleep
  *
