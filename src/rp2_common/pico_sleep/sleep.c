@@ -42,6 +42,13 @@
 
 static dormant_source_t _dormant_source;
 
+// Static variables for internal use by the GPIO IRQ handler
+static volatile bool __sleep_pin_triggered;
+static hardware_alarm_callback_t __sleep_user_callback;
+static int __sleep_alarm_num;
+static uint __sleep_gpio_pin;
+static uint32_t __sleep_event;
+
 bool dormant_source_valid(dormant_source_t dormant_source)
 {
     switch (dormant_source) {
@@ -156,30 +163,78 @@ static void processor_deep_sleep(void) {
 #endif
 }
 
-void sleep_goto_sleep_until(struct timespec *ts, aon_timer_alarm_handler_t callback)
-{
+static void __sleep_gpio_irq_callback(uint gpio, uint32_t events) {
+    if ((gpio == __sleep_gpio_pin) && (events & __sleep_event)) {
+        __sleep_pin_triggered = true;
 
-    // We should have already called the sleep_run_from_dormant_source function
-    // This is only needed for dormancy although it saves power running from xosc while sleeping
-    //assert(dormant_source_valid(_dormant_source));
+        // Cancel the timer alarm since the pin woke us first
+        hardware_alarm_set_callback(__sleep_alarm_num, NULL);
+        hardware_alarm_unclaim(__sleep_alarm_num);
 
-#if PICO_RP2040
+        // Run the user callback (if provided) in IRQ context
+        if (__sleep_user_callback) {
+            __sleep_user_callback(__sleep_alarm_num);
+        }
+
+        // Clear the irq so we can go back to dormant mode again if we want
+        gpio_set_irq_enabled(gpio, __sleep_event, false);
+        gpio_acknowledge_irq(gpio, __sleep_event);
+    }
+}
+
+bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
+                                   aon_timer_alarm_handler_t callback,
+                                   uint gpio_pin, bool edge, bool high) {
+    // 1) Figure out the GPIO wake event
+    bool level = !edge;
+    bool low   = !high;
+    uint32_t gpio_event = 0;
+    if (level) {
+        gpio_event = low ? GPIO_IRQ_LEVEL_LOW : GPIO_IRQ_LEVEL_HIGH;
+    } else {
+        gpio_event = high ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL;
+    }
+
+    // 2) Leave only AON/RTC clock running
+  #if PICO_RP2040
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_RTC_RTC_BITS;
-    clocks_hw->sleep_en1 = 0x0;
-#else
+    clocks_hw->sleep_en1 = 0;
+  #else
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
-    clocks_hw->sleep_en1 = 0x0;
-#endif
+    clocks_hw->sleep_en1 = 0;
+  #endif
 
+    // 3) Arm the AON timer
     aon_timer_enable_alarm(ts, callback, false);
+
+    // 4) Configure the GPIO as a second wake source
+    gpio_init(gpio_pin);
+    gpio_set_input_enabled(gpio_pin, true);
+    __sleep_gpio_pin      = gpio_pin;
+    __sleep_event         = gpio_event;
+    __sleep_pin_triggered = false;
+    __sleep_user_callback = NULL;  // not used here
+    gpio_set_irq_enabled_with_callback(
+        gpio_pin, gpio_event, true, &__sleep_gpio_irq_callback);
 
     stdio_flush();
 
-    // Enable deep sleep at the proc
+    // 5) Enter deep sleep
     processor_deep_sleep();
-
-    // Go to sleep
     __wfi();
+
+    // 6) Woke up — first clear the GPIO IRQ
+    gpio_set_irq_enabled(gpio_pin, gpio_event, false);
+    gpio_acknowledge_irq(gpio_pin, gpio_event);
+
+    // 7) If we woke on the pin, cancel the AON timer before it fires
+    if (!__sleep_pin_triggered) {
+        // Timer actually fired, so leave it (it’ll re-invoke timer_cb);
+        // otherwise disable it so it won’t fire later.
+        aon_timer_disable_alarm();
+    }
+
+    return true;
 }
 
 bool sleep_goto_sleep_for(uint32_t delay_ms, hardware_alarm_callback_t callback)
@@ -214,6 +269,59 @@ bool sleep_goto_sleep_for(uint32_t delay_ms, hardware_alarm_callback_t callback)
 
     // Go to sleep
     __wfi();
+    return true;
+}
+
+bool sleep_goto_sleep_for_or_pin(uint32_t delay_ms, hardware_alarm_callback_t callback,
+                                 uint gpio_pin, bool edge, bool high) {
+    bool level = !edge;
+    uint32_t event = 0;
+    if (level) {
+        event = high ? GPIO_IRQ_LEVEL_HIGH : GPIO_IRQ_LEVEL_LOW;
+    } else {
+        event = high ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL;
+    }
+
+    // Turn off all clocks except for the timer
+    clocks_hw->sleep_en0 = 0x0;
+#if PICO_RP2040
+    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_SYS_TIMER_BITS;
+#elif PICO_RP2350
+    clocks_hw->sleep_en1 = CLOCKS_SLEEP_EN1_CLK_REF_TICKS_BITS | CLOCKS_SLEEP_EN1_CLK_SYS_TIMER0_BITS;
+#else
+#error Unknown processor
+#endif
+
+    int alarm_num = hardware_alarm_claim_unused(true);
+    hardware_alarm_set_callback(alarm_num, callback);
+    absolute_time_t t = make_timeout_time_ms(delay_ms);
+    if (hardware_alarm_set_target(alarm_num, t)) {
+        hardware_alarm_set_callback(alarm_num, NULL);
+        hardware_alarm_unclaim(alarm_num);
+        return false;
+    }
+
+    // Configure the GPIO as a wake-up source
+    gpio_set_input_enabled(gpio_pin, true);
+    __sleep_gpio_pin = gpio_pin;
+    __sleep_event = event;
+    __sleep_alarm_num = alarm_num;
+    __sleep_user_callback = callback;
+    __sleep_pin_triggered = false;
+    gpio_set_irq_enabled_with_callback(gpio_pin, event, true, &__sleep_gpio_irq_callback);
+
+    stdio_flush();
+    processor_deep_sleep();
+    __wfi();
+
+    // Clear the irq so we can go back to dormant mode again if we want
+    gpio_set_irq_enabled(gpio_pin, event, false);
+    gpio_acknowledge_irq(gpio_pin, event);
+    if (!__sleep_pin_triggered) {
+        hardware_alarm_set_callback(alarm_num, NULL);
+        hardware_alarm_unclaim(alarm_num);
+    }
+
     return true;
 }
 
