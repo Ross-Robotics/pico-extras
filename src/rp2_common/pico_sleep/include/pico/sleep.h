@@ -76,6 +76,21 @@ static inline void sleep_run_from_rosc(void) {
  */
 void sleep_goto_sleep_until(struct timespec *ts, aon_timer_alarm_handler_t callback);
 
+/*! \brief Send system to sleep until the specified GPIO changes
+ *  \ingroup hardware_sleep
+ *
+ * One of the sleep_run_* functions must be called prior to this call
+ *
+ * \param ts The time to wake up
+ * \param callback Function to call on wakeup.
+ * \param gpio_pin The pin to provide the wake up
+ * \param edge true for leading edge, false for trailing edge
+ * \param high true for active high, false for active low
+ */
+bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
+                                   aon_timer_alarm_handler_t callback,
+                                   uint gpio_pin, bool edge, bool high);
+
 /*! \brief Send system to sleep for a specified duration in milliseconds. This provides an alternative to sleep_goto_sleep_until
 to allow for shorter duration sleeps.
  *  \ingroup hardware_sleep
