@@ -182,6 +182,32 @@ static void __sleep_gpio_irq_callback(uint gpio, uint32_t events) {
     }
 }
 
+void sleep_goto_sleep_until(struct timespec *ts, aon_timer_alarm_handler_t callback)
+{
+
+    // We should have already called the sleep_run_from_dormant_source function
+    // This is only needed for dormancy although it saves power running from xosc while sleeping
+    //assert(dormant_source_valid(_dormant_source));
+
+#if PICO_RP2040
+    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_RTC_RTC_BITS;
+    clocks_hw->sleep_en1 = 0x0;
+#else
+    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
+    clocks_hw->sleep_en1 = 0x0;
+#endif
+
+    aon_timer_enable_alarm(ts, callback, false);
+
+    stdio_flush();
+
+    // Enable deep sleep at the proc
+    processor_deep_sleep();
+
+    // Go to sleep
+    __wfi();
+}
+
 bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
                                    aon_timer_alarm_handler_t callback,
                                    uint gpio_pin, bool edge, bool high) {
