@@ -44,10 +44,14 @@ static dormant_source_t _dormant_source;
 
 // Static variables for internal use by the GPIO IRQ handler
 static volatile bool __sleep_pin_triggered;
-static hardware_alarm_callback_t __sleep_user_callback;
+static hardware_alarm_callback_t __sleep_user_callback;  // hardware alarm user cb (sleep_for paths)
+static aon_timer_alarm_handler_t __sleep_user_aon_cb;    // AON timer user cb (sleep_until paths)
 static int __sleep_alarm_num;
 static uint __sleep_gpio_pin;
 static uint32_t __sleep_event;
+
+// Distinguish which timing mechanism is active for the current sleep
+static bool __sleep_uses_hardware_alarm = false; // true: hardware alarm; false: AON timer
 
 bool dormant_source_valid(dormant_source_t dormant_source)
 {
@@ -167,16 +171,25 @@ static void __sleep_gpio_irq_callback(uint gpio, uint32_t events) {
     if ((gpio == __sleep_gpio_pin) && (events & __sleep_event)) {
         __sleep_pin_triggered = true;
 
-        // Cancel the timer alarm since the pin woke us first
-        hardware_alarm_set_callback(__sleep_alarm_num, NULL);
-        hardware_alarm_unclaim(__sleep_alarm_num);
-
-        // Run the user callback (if provided) in IRQ context
-        if (__sleep_user_callback) {
-            __sleep_user_callback(__sleep_alarm_num);
+        // Cancel whichever timing mechanism was armed
+        if (__sleep_uses_hardware_alarm) {
+            // Hardware alarm path (sleep_goto_sleep_for[_or_pin])
+            hardware_alarm_set_callback(__sleep_alarm_num, NULL);
+            hardware_alarm_unclaim(__sleep_alarm_num);
+            // Run the user callback (if provided) in IRQ context
+            if (__sleep_user_callback) {
+                __sleep_user_callback(__sleep_alarm_num);
+            }
+        } else {
+            // AON timer path (sleep_goto_sleep_until[_or_pin])
+            aon_timer_disable_alarm();
+            // Optionally invoke the user's AON callback on pin wake as well
+            if (__sleep_user_aon_cb) {
+                __sleep_user_aon_cb();
+            }
         }
 
-        // Clear the irq so we can go back to dormant mode again if we want
+        // Clear the irq so we can go back to sleep/dormant again if we want
         gpio_set_irq_enabled(gpio, __sleep_event, false);
         gpio_acknowledge_irq(gpio, __sleep_event);
     }
@@ -196,6 +209,10 @@ void sleep_goto_sleep_until(struct timespec *ts, aon_timer_alarm_handler_t callb
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
     clocks_hw->sleep_en1 = 0x0;
 #endif
+
+    __sleep_uses_hardware_alarm = false;
+    __sleep_user_aon_cb = callback;
+    __sleep_user_callback = NULL;
 
     aon_timer_enable_alarm(ts, callback, false);
 
@@ -230,6 +247,11 @@ bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
     clocks_hw->sleep_en1 = 0;
   #endif
 
+    // This path uses the AON timer (not hardware alarm)
+    __sleep_uses_hardware_alarm = false;
+    __sleep_user_aon_cb = callback;
+    __sleep_user_callback = NULL;
+
     // 3) Arm the AON timer
     aon_timer_enable_alarm(ts, callback, false);
 
@@ -239,7 +261,6 @@ bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
     __sleep_gpio_pin      = gpio_pin;
     __sleep_event         = gpio_event;
     __sleep_pin_triggered = false;
-    __sleep_user_callback = NULL;  // not used here
     gpio_set_irq_enabled_with_callback(
         gpio_pin, gpio_event, true, &__sleep_gpio_irq_callback);
 
@@ -254,10 +275,11 @@ bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
     gpio_acknowledge_irq(gpio_pin, gpio_event);
 
     // 7) If we woke on the pin, cancel the AON timer before it fires
-    if (!__sleep_pin_triggered) {
-        // Timer actually fired, so leave it (it’ll re-invoke timer_cb);
-        // otherwise disable it so it won’t fire later.
+    if (__sleep_pin_triggered) {
+        // Ensure the AON alarm won't fire after the pin wake
         aon_timer_disable_alarm();
+    } else {
+        // Timer actually fired, so leave it (it already invoked the callback)
     }
 
     return true;
@@ -279,7 +301,13 @@ bool sleep_goto_sleep_for(uint32_t delay_ms, hardware_alarm_callback_t callback)
 #error Unknown processor
 #endif
 
+    __sleep_uses_hardware_alarm = true;
+    __sleep_user_callback = callback;
+    __sleep_user_aon_cb = NULL;
+
     int alarm_num = hardware_alarm_claim_unused(true);
+    __sleep_alarm_num = alarm_num;
+
     hardware_alarm_set_callback(alarm_num, callback);
     absolute_time_t t = make_timeout_time_ms(delay_ms);
     if (hardware_alarm_set_target(alarm_num, t)) {
@@ -318,7 +346,13 @@ bool sleep_goto_sleep_for_or_pin(uint32_t delay_ms, hardware_alarm_callback_t ca
 #error Unknown processor
 #endif
 
+    __sleep_uses_hardware_alarm = true;
+    __sleep_user_callback = callback;
+    __sleep_user_aon_cb = NULL;
+
     int alarm_num = hardware_alarm_claim_unused(true);
+    __sleep_alarm_num = alarm_num;
+
     hardware_alarm_set_callback(alarm_num, callback);
     absolute_time_t t = make_timeout_time_ms(delay_ms);
     if (hardware_alarm_set_target(alarm_num, t)) {
@@ -331,8 +365,6 @@ bool sleep_goto_sleep_for_or_pin(uint32_t delay_ms, hardware_alarm_callback_t ca
     gpio_set_input_enabled(gpio_pin, true);
     __sleep_gpio_pin = gpio_pin;
     __sleep_event = event;
-    __sleep_alarm_num = alarm_num;
-    __sleep_user_callback = callback;
     __sleep_pin_triggered = false;
     gpio_set_irq_enabled_with_callback(gpio_pin, event, true, &__sleep_gpio_irq_callback);
 
@@ -376,6 +408,11 @@ void sleep_goto_dormant_until(struct timespec *ts, aon_timer_alarm_handler_t cal
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
     clocks_hw->sleep_en1 = 0x0;
 #endif
+
+    // AON path
+    __sleep_uses_hardware_alarm = false;
+    __sleep_user_aon_cb = callback;
+    __sleep_user_callback = NULL;
 
     // Set the AON timer to wake up the proc from dormant mode
     aon_timer_enable_alarm(ts, callback, true);
