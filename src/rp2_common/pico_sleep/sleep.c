@@ -44,6 +44,7 @@ static dormant_source_t _dormant_source;
 
 // Static variables for internal use by the GPIO IRQ handler
 static volatile bool __sleep_pin_triggered;
+static volatile bool __sleep_aon_fired;
 static hardware_alarm_callback_t __sleep_user_callback;  // hardware alarm user cb (sleep_for paths)
 static aon_timer_alarm_handler_t __sleep_user_aon_cb;    // AON timer user cb (sleep_until paths)
 static int __sleep_alarm_num;
@@ -167,6 +168,13 @@ static void processor_deep_sleep(void) {
 #endif
 }
 
+static void __sleep_aon_wrapper(void) {
+    __sleep_aon_fired = true;
+    if (__sleep_user_aon_cb) {
+        __sleep_user_aon_cb();
+    }
+}
+
 static void __sleep_gpio_irq_callback(uint gpio, uint32_t events) {
     if ((gpio == __sleep_gpio_pin) && (events & __sleep_event)) {
         __sleep_pin_triggered = true;
@@ -228,76 +236,102 @@ void sleep_goto_sleep_until(struct timespec *ts, aon_timer_alarm_handler_t callb
 bool sleep_goto_sleep_until_or_pin(struct timespec *ts,
                                    aon_timer_alarm_handler_t callback,
                                    uint gpio_pin, bool edge, bool high) {
-    assert(dormant_source_valid(_dormant_source));
+#if PICO_RP2040
+    // --- 1) Only keep RTC clock running in sleep ---
+    clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_RTC_RTC_BITS;
+    clocks_hw->sleep_en1 = 0;
 
-    // 1) Figure out the GPIO wake event
-    bool level = !edge;
+    __sleep_uses_hardware_alarm = false;
+    __sleep_user_aon_cb         = callback;
+    __sleep_user_callback       = NULL;
+
+    __sleep_aon_fired = false;
+
+    // --- 2) Arm the AON timer using a wrapper so we can tell if it fired ---
+    aon_timer_enable_alarm(ts, __sleep_aon_wrapper, false);
+
+    // --- 3) Configure GPIO as a dormant wake source (low-power path) ---
     bool low   = !high;
-    uint32_t gpio_event = 0;
-    if (level) {
-        gpio_event = low ? GPIO_IRQ_LEVEL_LOW : GPIO_IRQ_LEVEL_HIGH;
+    bool level = !edge;
+
+    assert(gpio_pin < NUM_BANK0_GPIOS);
+
+    uint32_t event = 0;
+    if (level && low)  event = IO_BANK0_DORMANT_WAKE_INTE0_GPIO0_LEVEL_LOW_BITS;
+    if (level && high) event = IO_BANK0_DORMANT_WAKE_INTE0_GPIO0_LEVEL_HIGH_BITS;
+    if (edge && high)  event = IO_BANK0_DORMANT_WAKE_INTE0_GPIO0_EDGE_HIGH_BITS;
+    if (edge && low)   event = IO_BANK0_DORMANT_WAKE_INTE0_GPIO0_EDGE_LOW_BITS;
+
+    gpio_init(gpio_pin);
+    gpio_set_input_enabled(gpio_pin, true);
+    gpio_set_dormant_irq_enabled(gpio_pin, event, true);
+
+    stdio_flush();
+
+    // --- 4) Enter deep sleep ---
+    processor_deep_sleep();
+    __wfi();
+
+    // --- 5) Woke up: clean up GPIO dormant wake and AON timer ---
+    gpio_acknowledge_irq(gpio_pin, event);
+    gpio_set_dormant_irq_enabled(gpio_pin, event, false);
+    gpio_set_input_enabled(gpio_pin, false);
+
+    bool woke_on_pin = !__sleep_aon_fired;
+
+    if (woke_on_pin) {
+        // We woke due to the pin before the AON timer fired; cancel the timer.
+        aon_timer_disable_alarm();
     } else {
-        gpio_event = high ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL;
+        // Timer fired; wrapper has already run the user's callback.
     }
 
-    // 2) Leave only AON/RTC clock running (and prepare powman tick if present)
+    return woke_on_pin;
+#else
+    // Non-RP2040: fall back to your previous implementation
+    bool level = !edge;
+    uint32_t event = 0;
+    if (level) {
+        event = high ? GPIO_IRQ_LEVEL_HIGH : GPIO_IRQ_LEVEL_LOW;
+    } else {
+        event = high ? GPIO_IRQ_EDGE_RISE : GPIO_IRQ_EDGE_FALL;
+    }
+
   #if PICO_RP2040
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_RTC_RTC_BITS;
     clocks_hw->sleep_en1 = 0;
   #else
-    if (_dormant_source == DORMANT_SOURCE_LPOSC) {
-        uint64_t restore_ms = powman_timer_get_ms();
-        powman_timer_set_1khz_tick_source_lposc();
-        powman_timer_set_ms(restore_ms);
-    }
     clocks_hw->sleep_en0 = CLOCKS_SLEEP_EN0_CLK_REF_POWMAN_BITS;
     clocks_hw->sleep_en1 = 0;
   #endif
 
-    // This path uses the AON timer (not hardware alarm)
     __sleep_uses_hardware_alarm = false;
     __sleep_user_aon_cb = callback;
     __sleep_user_callback = NULL;
-    __sleep_pin_triggered = false;
-    __sleep_gpio_pin = gpio_pin;
-    __sleep_event = gpio_event;
 
-    // 3) Arm the AON timer (allowing low power wake)
-    aon_timer_enable_alarm(ts, callback, true);
+    aon_timer_enable_alarm(ts, callback, false);
 
-    // 4) Configure the GPIO as a second wake source
     gpio_init(gpio_pin);
     gpio_set_input_enabled(gpio_pin, true);
-    gpio_set_dormant_irq_enabled(gpio_pin, gpio_event, true);
+    __sleep_gpio_pin      = gpio_pin;
+    __sleep_event         = event;
+    __sleep_pin_triggered = false;
     gpio_set_irq_enabled_with_callback(
-        gpio_pin, gpio_event, true, &__sleep_gpio_irq_callback);
+        gpio_pin, event, true, &__sleep_gpio_irq_callback);
 
     stdio_flush();
-
-    // 5) Enter dormant (all stoppable clocks off)
     processor_deep_sleep();
-    _go_dormant();
+    __wfi();
 
-    // 6) Woke up — first clear the GPIO IRQ
-    gpio_set_irq_enabled(gpio_pin, gpio_event, false);
-    gpio_set_dormant_irq_enabled(gpio_pin, gpio_event, false);
-    gpio_acknowledge_irq(gpio_pin, gpio_event);
-    gpio_set_input_enabled(gpio_pin, false);
+    gpio_set_irq_enabled(gpio_pin, event, false);
+    gpio_acknowledge_irq(gpio_pin, event);
 
-    // 7) If we woke on the pin, cancel the AON timer before it fires
-    bool woke_from_pin = __sleep_pin_triggered;
-    if (!woke_from_pin && !level) {
-        woke_from_pin = gpio_get_irq_event_mask(gpio_pin) & gpio_event;
+    if (__sleep_pin_triggered) {
+        aon_timer_disable_alarm();
     }
 
-    if (woke_from_pin) {
-        aon_timer_disable_alarm(); // Ensure the AON alarm won't fire after the pin wake
-        if (__sleep_user_aon_cb && !__sleep_pin_triggered) {
-            __sleep_user_aon_cb();
-        }
-    }
-
-    return true;
+    return __sleep_pin_triggered;
+#endif
 }
 
 bool sleep_goto_sleep_for(uint32_t delay_ms, hardware_alarm_callback_t callback)
