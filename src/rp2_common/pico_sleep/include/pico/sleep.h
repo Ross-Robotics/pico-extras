@@ -76,6 +76,18 @@ static inline void sleep_run_from_rosc(void) {
  */
 void sleep_goto_sleep_until(struct timespec *ts, aon_timer_alarm_handler_t callback);
 
+/*! \brief Send system to sleep until the specified GPIO event occurs
+ *  \ingroup hardware_sleep
+ *
+ * One of the sleep_run_* functions must be called prior to this call.
+ * Call sleep_power_up immediately after this function returns.
+ *
+ * \param gpio_pin The pin to provide the wake up
+ * \param edge true to trigger on an edge, false to trigger on a level
+ * \param high true for rising/high, false for falling/low
+ */
+void sleep_goto_sleep_until_pin(uint gpio_pin, bool edge, bool high);
+
 /*! \brief Send system to sleep until the specified GPIO changes
  *  \ingroup hardware_sleep
  *
